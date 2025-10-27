@@ -1,15 +1,16 @@
 use core::array;
 use core::borrow::Borrow;
+use std::ops::Add;
 
 use p3_air::{Air, AirBuilder, BaseAir};
-use p3_field::{PrimeCharacteristicRing, PrimeField32};
+use p3_field::{Algebra, Field, FieldArray, PrimeCharacteristicRing, PrimeField, PrimeField32};
 use p3_matrix::Matrix;
 use p3_matrix::dense::RowMajorMatrix;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 
 use crate::columns::{NUM_SHA_COLS, ShaCols};
-use crate::constants::{NUM_ROUNDS, NUM_ROUNDS_MIN_1, U32_LIMBS};
+use crate::constants::{NUM_ROUNDS, NUM_ROUNDS_MIN_1, U32_BITS, U32_LIMBS};
 use crate::generation::generate_trace_rows;
 
 /// Assumes the field size is at least 16 bits.
@@ -61,7 +62,7 @@ impl<AB: AirBuilder> Air<AB> for ShaAir {
         // If this is not the first step, assert all value in input_block must be zero.
         builder
             .when(not_first_step.clone())
-            .assert_zeros::<64, _>(array::from_fn( |i|  { local.input_block[i]}));
+            .assert_zeros::<64, _>(array::from_fn( |i|  { local.input_block[i].clone()}));
 
         // If this is not the final step, the local seed and next prev_seed must match.
         for i in 0..NUM_ROUNDS {
@@ -85,10 +86,17 @@ impl<AB: AirBuilder> Air<AB> for ShaAir {
             if i < 16 {
                 // assert all values in buf from 0 to 16 is equal to input block little endian
                 builder.assert_bools(local.buf[i].clone());
-                builder.assert_zeros::<4, _>(array::from_fn( | j | {
-                    // TODO
-                         
+                builder.assert_zeros::<16, _>(array::from_fn( | j: usize | {
+                    local.buf[i][j].clone() - local.input_block[i * 4 + j].clone()
                 }))
+            } else {
+                // TODO: right rotate air
+                // builder.assert_zeros::<48, _>(array::from_fn( | j | {
+                //     let v1 = &local.buf[i-2].iter().enumerate().fold(AB::Expr::ZERO, |acc, (i, x)|  {
+                //         acc + x.clone().into() * AB::Expr::from_u32(1 << (i * 8))
+                //     });
+                    
+                // }));
             }
         }
 
