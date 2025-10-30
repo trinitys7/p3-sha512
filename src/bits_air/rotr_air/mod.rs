@@ -17,12 +17,17 @@ pub struct RightRotateAir<T> {
     /// b << (8 - c_mod) of `shrcarry` on each byte of a word.
     pub left_aligned_carry: [T; U32_LIMBS],
 
+    /// b - (b >> c_mod) << c_mod of `shrcarry` on each byte of a word.
+    pub shift_remainder: [T; U32_LIMBS],
+    pub shift_overflow: [T; U32_LIMBS],
+
     /// The shift output of `shrcarry` on each byte of a word.
     pub shift: [T; U32_LIMBS],
 
     /// The carry ouytput of `shrcarry` on each byte of a word.
     pub carry: [T; U32_LIMBS],
 }
+
 pub const NUM_RIGHT_ROTATE_COLS: usize = size_of::<RightRotateAir<u8>>();
 
 impl<F: PrimeField32> RightRotateAir<F> {
@@ -63,17 +68,24 @@ impl<F: PrimeField32> RightRotateAir<F> {
         for i in (0..U32_LIMBS).rev() {
             let b = input_bytes_rotated[i].to_string().parse::<u8>().unwrap();
             let c = nb_bits_to_shift as u8;
+            self.shift_overflow[i] = F::ZERO;
 
             let (shift, carry) = {
                 let c_mod = c & 0x7;
                 if c_mod != 0 {
                     let res = b >> c_mod;
+                    let remainder = b - (res << c_mod);
                     let carry = (b << (8 - c_mod)) >> (8 - c_mod);
-                    self.c_mod_is_zero[i] = F::ONE;
+                    self.c_mod_is_zero[i] = F::ZERO;
                     self.left_aligned_carry[i] = F::from_u8(b << (8 - c_mod));
+                    if ((b as u32) << (8 - c_mod)) > 255 {
+                        self.shift_overflow[i] = F::from_u8(((b as u32) << (8 - c_mod) >> 8) as u8);
+                    }
+                    self.shift_remainder[i] = F::from_u8(remainder);
                     (res, carry)
                 } else {
-                    self.c_mod_is_zero[i] = F::ZERO;
+                    self.c_mod_is_zero[i] = F::ONE;
+                    self.left_aligned_carry[i] = F::ZERO;
                     (b, 0u8)
                 }
             };
@@ -103,7 +115,7 @@ impl<F: PrimeField32> RightRotateAir<F> {
 
     pub fn eval<AB: AirBuilder>(
         builder: &mut AB,
-        input: [AB::Var; U32_LIMBS],
+        input: [AB::Expr; U32_LIMBS],
         rotation: usize,
         cols: &RightRotateAir<AB::Var>,
     ) {
@@ -125,7 +137,6 @@ impl<F: PrimeField32> RightRotateAir<F> {
         let mut first_shift = AB::Expr::ZERO;
         let mut last_carry = AB::Expr::ZERO;
         for i in (0..U32_LIMBS).rev() {
-            // TODO: assert shift right carry
             let c_mod = (nb_bits_to_shift & 0x07) as u8;
 
             let c_mod_not_zero = AB::Expr::ONE - cols.c_mod_is_zero[i].clone();
@@ -138,40 +149,46 @@ impl<F: PrimeField32> RightRotateAir<F> {
                 .assert_eq(input_bytes_rotated[i].clone(), cols.shift[i].clone());
             builder
                 .when(cols.c_mod_is_zero[i].clone())
-                .assert_eq(AB::Expr::ZERO, cols.carry[i].clone());
+                .assert_zero(cols.carry[i].clone());
+            builder
+                .when(cols.c_mod_is_zero[i].clone())
+                .assert_zero(cols.left_aligned_carry[i].clone());
+            builder
+                .when(cols.c_mod_is_zero[i].clone())
+                .assert_zero(cols.shift_overflow[i].clone());
 
             // assert when c_mod is not zero
             let left_shift_amount = 8 - c_mod;
             builder.when(c_mod_not_zero.clone()).assert_eq(
-                cols.shift[i].clone(),
-                input_bytes_rotated[i]
-                    .clone()
-                    .into()
-                    .div_2exp_u64(c_mod as u64),
+                input_bytes_rotated[i].clone(),
+                cols.shift[i].clone().into().mul_2exp_u64(c_mod as u64)
+                    + cols.shift_remainder[i].clone(),
             );
             builder.when(c_mod_not_zero.clone()).assert_eq(
-                cols.left_aligned_carry[i].clone(),
+                cols.left_aligned_carry[i].clone()
+                    + cols.shift_overflow[i].clone().into().mul_2exp_u64(8),
                 input_bytes_rotated[i]
                     .clone()
-                    .into()
                     .mul_2exp_u64(left_shift_amount as u64),
             );
             builder.when(c_mod_not_zero).assert_eq(
-                cols.carry[i].clone(),
-                cols.left_aligned_carry[i]
+                cols.carry[i]
                     .clone()
                     .into()
-                    .div_2exp_u64(left_shift_amount as u64),
+                    .mul_2exp_u64(left_shift_amount as u64),
+                cols.left_aligned_carry[i].clone(),
             );
 
             // assert when c_mod is zero
             builder
                 .when(cols.c_mod_is_zero[i].clone())
-                .assert_eq(cols.shift[i].clone(), input_bytes_rotated[i].clone().into());
+                .assert_eq(cols.shift[i].clone(), input_bytes_rotated[i].clone());
             builder
                 .when(cols.c_mod_is_zero[i].clone())
                 .assert_zero(cols.carry[i].clone());
-
+            builder
+                .when(cols.c_mod_is_zero[i].clone())
+                .assert_zero(cols.left_aligned_carry[i].clone());
             if i == U32_LIMBS - 1 {
                 first_shift = cols.shift[i].clone().into();
             } else {
@@ -192,17 +209,6 @@ impl<F: PrimeField32> RightRotateAir<F> {
     }
 }
 
-pub const fn shr_carry(input: u8, rotation: u8) -> (u8, u8) {
-    let c_mod = rotation & 0x7;
-    if c_mod != 0 {
-        let res = input >> c_mod;
-        let carry = (input << (8 - c_mod)) >> (8 - c_mod);
-        (res, carry)
-    } else {
-        (input, 0u8)
-    }
-}
-
 impl<F> Borrow<RightRotateAir<F>> for [F] {
     fn borrow(&self) -> &RightRotateAir<F> {
         debug_assert_eq!(self.len(), NUM_RIGHT_ROTATE_COLS);
@@ -215,17 +221,23 @@ impl<F> Borrow<RightRotateAir<F>> for [F] {
 }
 
 pub mod tests {
+    use crate::bits_air::rotr_air::{NUM_RIGHT_ROTATE_COLS, RightRotateAir};
+    use core::borrow::Borrow;
     use p3_air::{Air, AirBuilder, BaseAir};
+    use p3_baby_bear::BabyBear;
     use p3_challenger::{
         DuplexChallenger, HashChallenger, SerializingChallenger32, SerializingChallenger64,
     };
     use p3_circle::CirclePcs;
     use p3_commit::ExtensionMmcs;
     use p3_dft::Radix2DitParallel;
-    use p3_field::{extension::BinomialExtensionField, Field, PrimeCharacteristicRing, PrimeField32};
+    use p3_field::{
+        Field, PrimeCharacteristicRing, PrimeField32, extension::BinomialExtensionField,
+    };
     use p3_fri::{TwoAdicFriPcs, create_benchmark_fri_params_zk};
+    use p3_goldilocks::Goldilocks;
     use p3_keccak::{Keccak256Hash, KeccakF};
-    use p3_matrix::{dense::RowMajorMatrix, Matrix};
+    use p3_matrix::{Matrix, dense::RowMajorMatrix};
     use p3_merkle_tree::MerkleTreeMmcs;
     use p3_mersenne_31::{Mersenne31, Poseidon2Mersenne31};
     use p3_sha256::Sha256;
@@ -238,13 +250,11 @@ pub mod tests {
         rngs::{SmallRng, StdRng},
     };
     use std::{fmt::Debug, io::Error, marker::PhantomData};
-    use core::borrow::Borrow;
-    use crate::bits_air::rotr_air::{NUM_RIGHT_ROTATE_COLS, RightRotateAir};
 
     #[derive(Debug)]
     pub struct ExampleAir {
         input: u32,
-        rotation: usize
+        rotation: usize,
     }
 
     impl ExampleAir {
@@ -254,13 +264,13 @@ pub mod tests {
             rotation: usize,
             extra_capacity_bits: usize,
         ) -> RowMajorMatrix<F> {
-                
             let trace_length = NUM_RIGHT_ROTATE_COLS;
             let mut long_trace = F::zero_vec(trace_length << extra_capacity_bits);
             long_trace.truncate(trace_length);
 
             let mut trace = RowMajorMatrix::new(long_trace, NUM_RIGHT_ROTATE_COLS);
-            let (prefix, rows, suffix) = unsafe { trace.values.align_to_mut::<RightRotateAir<F>>() };
+            let (prefix, rows, suffix) =
+                unsafe { trace.values.align_to_mut::<RightRotateAir<F>>() };
             assert!(prefix.is_empty(), "Alignment should match");
             assert!(suffix.is_empty(), "Alignment should match");
             assert_eq!(rows.len(), 1);
@@ -271,13 +281,11 @@ pub mod tests {
         }
     }
 
-
     impl<F> BaseAir<F> for ExampleAir {
         fn width(&self) -> usize {
             NUM_RIGHT_ROTATE_COLS
         }
     }
-
 
     impl<AB: AirBuilder<F: PrimeField32>> Air<AB> for ExampleAir {
         #[inline]
@@ -285,9 +293,8 @@ pub mod tests {
             let main = builder.main();
             let local = main.row_slice(0).unwrap();
             let local: &RightRotateAir<AB::Var> = (*local).borrow();
-            let input = self.input.to_le_bytes().map(AB::Var::from_u8);
-            RightRotateAir::<AB::F>::eval::<AB>(
-                builder, input, self.rotation, local);
+            let input = self.input.to_le_bytes().map(AB::Expr::from_u8);
+            RightRotateAir::<AB::F>::eval::<AB>(builder, input, self.rotation, local);
         }
     }
 
@@ -296,8 +303,8 @@ pub mod tests {
         // WARNING: Use a real cryptographic PRNG in applications!!
         let mut rng = SmallRng::seed_from_u64(1);
 
-        type Val = Mersenne31;
-        type Challenge = BinomialExtensionField<Val, 3>;
+        type Val = BabyBear;
+        type Challenge = BinomialExtensionField<Val, 4>;
 
         type ByteHash = Sha256;
         type FieldHash = SerializingHasher<ByteHash>;
@@ -313,32 +320,23 @@ pub mod tests {
         type ChallengeMmcs = ExtensionMmcs<Val, Challenge, ValMmcs>;
         let challenge_mmcs = ChallengeMmcs::new(val_mmcs.clone());
 
-        type Challenger = SerializingChallenger32<Val, HashChallenger<u8, ByteHash, 32>>;
+        type Dft = Radix2DitParallel<Val>;
+        let dft = Dft::default();
+
+        type Challenger = SerializingChallenger64<Val, HashChallenger<u8, ByteHash, 32>>;
         let challenger = Challenger::from_hasher(vec![], byte_hash);
 
         let fri_params = create_benchmark_fri_params_zk(challenge_mmcs);
 
         let input: u32 = rng.random();
-        println!("input: {}", input);
-
         let rotation: usize = rng.random_range(1..31);
-        println!("rotation: {}", rotation);
-        println!("right rotate: {}", input.rotate_right(rotation as u32));
 
-        let air = ExampleAir{
-            input,
-            rotation,
-        };
+        let air = ExampleAir { input, rotation };
         let trace = air.generate_trace_rows(input, rotation, fri_params.log_blowup);
 
-        type Pcs = CirclePcs<Val, ValMmcs, ChallengeMmcs>;
-        let pcs = Pcs {
-            mmcs: val_mmcs,
-            fri_params,
-            _phantom: PhantomData,
-        };
+        type Pcs = TwoAdicFriPcs<Val, Dft, ValMmcs, ChallengeMmcs>;
+        let pcs = Pcs::new(dft, val_mmcs, fri_params);
 
-        
         type MyConfig = StarkConfig<Pcs, Challenge, Challenger>;
         let config = MyConfig::new(pcs, challenger);
 
